@@ -1,6 +1,7 @@
 import numpy
 import torch
 import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
 
 from torch_ac.algos.base import BaseAlgo
 
@@ -11,11 +12,11 @@ class PPOAlgo(BaseAlgo):
     def __init__(self, envs, acmodel, num_frames_per_proc=None, discount=0.99, lr=7e-4, gae_lambda=0.95,
                  entropy_coef=0.01, value_loss_coef=0.5, max_grad_norm=0.5, recurrence=4,
                  adam_eps=1e-5, clip_eps=0.2, epochs=4, batch_size=256, preprocess_obss=None,
-                 reshape_reward=None):
+                 reshape_reward=None, variable_view=False):
         num_frames_per_proc = num_frames_per_proc or 128
 
         super().__init__(envs, acmodel, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
-                         value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward)
+                         value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward, variable_view)
 
         self.clip_eps = clip_eps
         self.epochs = epochs
@@ -54,18 +55,31 @@ class PPOAlgo(BaseAlgo):
 
                 for i in range(self.recurrence):
                     # Create a sub-batch of experience
-
                     sb = exps[inds + i]
 
                     # Compute loss
 
                     if self.acmodel.recurrent:
-                        dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                        if self.variable_view:
+                            dist, gaze, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                            # Combine action and gaze distributions into single 1D distribution
+                            # gaze_dist = gaze[0].probs.ger(gaze[1].probs)
+                            # dist = Categorical(dist.probs.ger(gaze_dist.view(-1)))
+
+                            full_dist = []
+                            for j in range(inds.shape[0]):
+                                gaze_dist = gaze[0].probs[j].ger(gaze[1].probs[j]).view([-1])
+                                full_action_space_dist = Categorical((dist.probs[j].ger(gaze_dist)).view(-1))
+                                full_dist.append(full_action_space_dist.probs)
+                            dist = Categorical(torch.stack(full_dist))
+                            sb.action = sb.action.long() * 22 + sb.gaze[:, 0] * 11 + sb.gaze[:, 1]
+
+                        else:
+                            dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
                     else:
                         dist, value = self.acmodel(sb.obs)
 
                     entropy = dist.entropy().mean()
-
                     ratio = torch.exp(dist.log_prob(sb.action) - sb.log_prob)
                     surr1 = ratio * sb.advantage
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * sb.advantage

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import torch
 import numpy
+from torch.distributions.categorical import Categorical
 
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList, ParallelEnv
@@ -9,7 +10,7 @@ class BaseAlgo(ABC):
     """The base class for RL algorithms."""
 
     def __init__(self, envs, acmodel, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
-                 value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward):
+                 value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward, variable_view):
         """
         Initializes a `BaseAlgo` instance.
 
@@ -59,6 +60,7 @@ class BaseAlgo(ABC):
         self.recurrence = recurrence
         self.preprocess_obss = preprocess_obss or default_preprocess_obss
         self.reshape_reward = reshape_reward
+        self.variable_view = variable_view
 
         # Store helpers values
 
@@ -120,18 +122,30 @@ class BaseAlgo(ABC):
             reward, policy loss, value loss, etc.
         """
 
+        gazes = []
         for i in range(self.num_frames_per_proc):
             # Do one agent-environment interaction
-
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
+            # Initialize gaze to none - this is only used with variable view
+            gaze = None
             with torch.no_grad():
                 if self.acmodel.recurrent:
-                    dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    if self.variable_view:
+                        dist, gaze, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    else:
+                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:
                     dist, value = self.acmodel(preprocessed_obs)
-            action = dist.sample()
 
-            obs, reward, done, _ = self.env.step(action.cpu().numpy())
+            # If variable view is enabled the last two fields in the action vector are offsets not actions
+            if self.variable_view:
+                action = dist.sample()
+                gaze_action = torch.stack((3.0 * gaze[0].sample(), 3.0 * gaze[1].sample()), dim=1)
+                action_data = torch.cat((action.view([128,1]), gaze_action.long()), dim=1)
+                obs, reward, done, _ = self.env.step(action_data.cpu().numpy())
+            else:
+                action = dist.sample()
+                obs, reward, done, _ = self.env.step(action.cpu().numpy())
 
             # Update experiences values
 
@@ -153,6 +167,18 @@ class BaseAlgo(ABC):
                 self.rewards[i] = torch.tensor(reward, device=self.device)
             self.log_probs[i] = dist.log_prob(action)
 
+            # Compute 3D distribution log probs for action, x gaze and y gaze f using variable view
+            if self.variable_view:
+                log_probs = []
+                gaze_action /= 3.0
+                for j in range(128):
+                    gaze_dist = gaze[0].probs[j].ger(gaze[1].probs[j]).view([-1])
+                    full_action_space_dist = Categorical((dist.probs[j].ger(gaze_dist)).view(-1))
+                    action[j] = action[j] * 22 + gaze_action[j][0] * 11 + gaze_action[j][1]
+                    log_prob = full_action_space_dist.log_prob(action[j])
+                    log_probs.append(log_prob)
+                self.log_probs[i] = torch.Tensor(log_probs)
+
             # Update log values
 
             self.log_episode_return += torch.tensor(reward, device=self.device, dtype=torch.float)
@@ -170,12 +196,17 @@ class BaseAlgo(ABC):
             self.log_episode_reshaped_return *= self.mask
             self.log_episode_num_frames *= self.mask
 
+            gazes.append(gaze_action)
+
         # Add advantage and return to experiences
 
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
             if self.acmodel.recurrent:
-                _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                if self.variable_view:
+                    _, _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                else:
+                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
                 _, next_value = self.acmodel(preprocessed_obs)
 
@@ -212,6 +243,11 @@ class BaseAlgo(ABC):
         exps.returnn = exps.value + exps.advantage
         exps.log_prob = self.log_probs.transpose(0, 1).reshape(-1)
 
+        # If using variable view store the gaze
+        if self.variable_view:
+            gazes = torch.cat(gazes)
+            exps.gaze = gazes
+
         # Preprocess experiences
 
         exps.obs = self.preprocess_obss(exps.obs, device=self.device)
@@ -232,7 +268,7 @@ class BaseAlgo(ABC):
         self.log_reshaped_return = self.log_reshaped_return[-self.num_procs:]
         self.log_num_frames = self.log_num_frames[-self.num_procs:]
 
-        return exps, log
+        return exps, log, gazes * 3
 
     @abstractmethod
     def update_parameters(self):
