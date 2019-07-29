@@ -9,7 +9,7 @@ from torch_ac.utils import DictList, ParallelEnv
 class BaseAlgo(ABC):
     """The base class for RL algorithms."""
 
-    def __init__(self, envs, acmodel, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
+    def __init__(self, envs, acmodel, device, num_frames_per_proc, discount, lr, gae_lambda, entropy_coef,
                  value_loss_coef, max_grad_norm, recurrence, preprocess_obss, reshape_reward, variable_view):
         """
         Initializes a `BaseAlgo` instance.
@@ -49,7 +49,7 @@ class BaseAlgo(ABC):
 
         self.env = ParallelEnv(envs)
         self.acmodel = acmodel
-        self.acmodel.train()
+        self.device = device
         self.num_frames_per_proc = num_frames_per_proc
         self.discount = discount
         self.lr = lr
@@ -62,16 +62,20 @@ class BaseAlgo(ABC):
         self.reshape_reward = reshape_reward
         self.variable_view = variable_view
 
-        # Store helpers values
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.num_procs = len(envs)
-        self.num_frames = self.num_frames_per_proc * self.num_procs
-
         # Control parameters
 
         assert self.acmodel.recurrent or self.recurrence == 1
         assert self.num_frames_per_proc % self.recurrence == 0
+
+        # Configure acmodel
+
+        self.acmodel.to(self.device)
+        self.acmodel.train()
+
+        # Store helpers values
+
+        self.num_procs = len(envs)
+        self.num_frames = self.num_frames_per_proc * self.num_procs
 
         # Initialize experience values
 
@@ -256,7 +260,7 @@ class BaseAlgo(ABC):
 
         keep = max(self.log_done_counter, self.num_procs)
 
-        log = {
+        logs = {
             "return_per_episode": self.log_return[-keep:],
             "reshaped_return_per_episode": self.log_reshaped_return[-keep:],
             "num_frames_per_episode": self.log_num_frames[-keep:],
@@ -268,7 +272,7 @@ class BaseAlgo(ABC):
         self.log_reshaped_return = self.log_reshaped_return[-self.num_procs:]
         self.log_num_frames = self.log_num_frames[-self.num_procs:]
 
-        return exps, log, gazes * 3
+        return exps, logs, gazes * 3
 
     @abstractmethod
     def update_parameters(self):
