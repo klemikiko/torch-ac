@@ -145,7 +145,7 @@ class BaseAlgo(ABC):
             if self.variable_view:
                 action = dist.sample()
                 gaze_action = torch.stack((3.0 * gaze[0].sample(), 3.0 * gaze[1].sample()), dim=1)
-                action_data = torch.cat((action.view([128,1]), gaze_action.long()), dim=1)
+                action_data = torch.cat((action.view([-1,1]), gaze_action.long()), dim=1)
                 obs, reward, done, _ = self.env.step(action_data.cpu().numpy())
             else:
                 action = dist.sample()
@@ -175,7 +175,7 @@ class BaseAlgo(ABC):
             if self.variable_view:
                 log_probs = []
                 gaze_action /= 3.0
-                for j in range(128):
+                for j in range(gaze_action.shape[0]):
                     gaze_dist = gaze[0].probs[j].ger(gaze[1].probs[j]).view([-1])
                     full_action_space_dist = Categorical((dist.probs[j].ger(gaze_dist)).view(-1))
                     action[j] = action[j] * 22 + gaze_action[j][0] * 11 + gaze_action[j][1]
